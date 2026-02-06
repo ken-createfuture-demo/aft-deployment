@@ -15,11 +15,13 @@ VAULT_NAME="aft-controltower-backup-vault"
 REGION="eu-west-2"
 VAULT_PROFILE="aft-management"
 
-set -euo pipefail
+set -eo pipefail  # Removed -u flag
 export AWS_PAGER=""
 
 empty_bucket() {
-  local bucket=$1 profile=$2
+  local bucket="$1"
+  local profile="$2"
+
   echo -e "\n🗑  Emptying \e[1m$bucket\e[0m (profile: $profile)…"
 
   if ! aws s3api head-bucket --bucket "$bucket" --profile "$profile" 2>/dev/null; then
@@ -27,43 +29,77 @@ empty_bucket() {
     return 0
   fi
 
-  while true; do
-    # Paginate results (max 1000 per page)
-    token=""
-    objects_deleted=false
+  # Delete all object versions and delete markers
+  echo "  Removing all versions and delete markers..."
+  local retry_count=0
+  local max_retries=5
 
-    while :; do
-      resp=$(aws s3api list-object-versions --bucket "$bucket" --profile "$profile" \
-        --max-items 1000 ${token:+--starting-token "$token"} --output json)
+  while [ $retry_count -lt $max_retries ]; do
+    local objects_found=false
 
-      versions=$(jq '.Versions // []' <<<"$resp")
-      markers=$(jq '.DeleteMarkers // []' <<<"$resp")
-      all_objects=$(jq -s 'add' <<<"$versions $markers")
-      count=$(jq 'length' <<<"$all_objects")
+    # Get and delete versions
+    local versions
+    versions=$(aws s3api list-object-versions --bucket "$bucket" --profile "$profile" \
+      --query 'Versions[].{Key:Key,VersionId:VersionId}' --output json 2>/dev/null || echo "[]")
 
-      [[ "$count" -eq 0 ]] && break
+    local version_count
+    version_count=$(echo "$versions" | jq 'length' 2>/dev/null || echo "0")
 
-      echo "  Deleting $count objects (page)…"
-      delete_payload=$(jq '{Objects: ., Quiet: true}' <<<"$all_objects")
-      tmp=$(mktemp)
-      echo "$delete_payload" > "$tmp"
-      aws s3api delete-objects --bucket "$bucket" --profile "$profile" --delete "file://$tmp" >/dev/null
-      rm -f "$tmp"
-      objects_deleted=true
+    if [ "$version_count" -gt 0 ]; then
+      objects_found=true
+      echo "  Deleting $version_count versions..."
 
-      # Get next pagination token
-      token=$(jq -r '.NextToken // empty' <<<"$resp")
-      [[ -z "$token" ]] && break
-    done
+      local delete_payload
+      delete_payload=$(echo "$versions" | jq '{Objects: ., Quiet: true}' 2>/dev/null)
 
-    # If no objects deleted in this full pass → bucket is empty
-    [[ "$objects_deleted" == false ]] && break
-    sleep 1
+      if [ -n "$delete_payload" ]; then
+        local tmp_file
+        tmp_file=$(mktemp)
+        echo "$delete_payload" > "$tmp_file"
+        aws s3api delete-objects --bucket "$bucket" --profile "$profile" --delete "file://$tmp_file" >/dev/null 2>&1 || true
+        rm -f "$tmp_file"
+      fi
+    fi
+
+    # Get and delete delete markers
+    local markers
+    markers=$(aws s3api list-object-versions --bucket "$bucket" --profile "$profile" \
+      --query 'DeleteMarkers[].{Key:Key,VersionId:VersionId}' --output json 2>/dev/null || echo "[]")
+
+    local marker_count
+    marker_count=$(echo "$markers" | jq 'length' 2>/dev/null || echo "0")
+
+    if [ "$marker_count" -gt 0 ]; then
+      objects_found=true
+      echo "  Deleting $marker_count delete markers..."
+
+      local delete_payload
+      delete_payload=$(echo "$markers" | jq '{Objects: ., Quiet: true}' 2>/dev/null)
+
+      if [ -n "$delete_payload" ]; then
+        local tmp_file
+        tmp_file=$(mktemp)
+        echo "$delete_payload" > "$tmp_file"
+        aws s3api delete-objects --bucket "$bucket" --profile "$profile" --delete "file://$tmp_file" >/dev/null 2>&1 || true
+        rm -f "$tmp_file"
+      fi
+    fi
+
+    if [ "$objects_found" = false ]; then
+      break
+    fi
+
+    retry_count=$((retry_count + 1))
+    sleep 2
   done
 
+  # Try to delete the bucket
   echo "  Deleting bucket $bucket…"
-  aws s3api delete-bucket --bucket "$bucket" --profile "$profile" && \
+  if aws s3api delete-bucket --bucket "$bucket" --profile "$profile" 2>/dev/null; then
     echo "✅  $bucket removed successfully"
+  else
+    echo "⚠️  Could not delete $bucket (may still contain objects or have other dependencies)"
+  fi
 }
 
 purge_backup_vault() {
@@ -76,12 +112,18 @@ purge_backup_vault() {
     return 0
   fi
 
-  while true; do
+  local max_attempts=10
+  local attempt=1
+
+  while [ $attempt -le $max_attempts ]; do
+    echo "  Attempt $attempt/$max_attempts to clear recovery points..."
+
+    local recovery_points
     recovery_points=$(aws backup list-recovery-points-by-backup-vault \
       --backup-vault-name "$VAULT_NAME" --region "$REGION" \
-      --profile "$VAULT_PROFILE" --query 'RecoveryPoints[].RecoveryPointArn' --output text)
+      --profile "$VAULT_PROFILE" --query 'RecoveryPoints[].RecoveryPointArn' --output text 2>/dev/null || echo "")
 
-    if [[ -z "$recovery_points" || "$recovery_points" == "None" ]]; then
+    if [ -z "$recovery_points" ] || [ "$recovery_points" = "None" ]; then
       echo "  ✅ No recovery points left"
       break
     fi
@@ -90,25 +132,30 @@ purge_backup_vault() {
       echo "  • deleting recovery point: $arn"
       aws backup delete-recovery-point \
         --backup-vault-name "$VAULT_NAME" --recovery-point-arn "$arn" \
-        --region "$REGION" --profile "$VAULT_PROFILE" || echo "  ❌ Failed: $arn"
-      sleep 2
+        --region "$REGION" --profile "$VAULT_PROFILE" 2>/dev/null || echo "  ⚠️  Failed or already deleted: $arn"
     done
 
-    echo "  Waiting for recovery point deletions to propagate..."
-    sleep 15
+    echo "  Waiting 30 seconds for recovery point deletions to propagate..."
+    sleep 30
+    attempt=$((attempt + 1))
   done
 
+  # Try to delete the vault
   echo "  Deleting backup vault..."
-  aws backup delete-backup-vault \
-    --backup-vault-name "$VAULT_NAME" --region "$REGION" --profile "$VAULT_PROFILE" && \
+  if aws backup delete-backup-vault \
+      --backup-vault-name "$VAULT_NAME" --region "$REGION" --profile "$VAULT_PROFILE" 2>/dev/null; then
     echo "✅  Vault deleted successfully"
+  else
+    echo "⚠️  Could not delete vault (may still contain recovery points - retry the script)"
+  fi
 }
 
 echo "========== STEP 1: purge buckets =========="
 while read -r bucket profile; do
-  [[ -z "$bucket" || -z "$profile" ]] && continue
+  [ -z "$bucket" ] || [ -z "$profile" ] && continue
   empty_bucket "$bucket" "$profile" || echo "❌  Failed to empty $bucket"
 done <<< "$BUCKETS"
 
 purge_backup_vault
-echo -e "\n🎉  Cleanup completed — safe to rerun terraform destroy"
+echo -e "\n🎉  Cleanup completed — you may need to run this script again if recovery points are still being deleted"
+echo "After this completes, run: terraform destroy"

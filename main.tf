@@ -1,5 +1,4 @@
 module "aft" {
-  #source = "github.com/aws-ia/terraform-aws-control_tower_account_factory?ref=1.13.4"
   source = "git::https://github.com/aws-ia/terraform-aws-control_tower_account_factory"
   
   ct_management_account_id    = var.ct_management_account_id
@@ -12,8 +11,9 @@ module "aft" {
   vcs_provider                                  = "github"
   account_request_repo_name                     = "${var.github_username}/learn-terraform-aft-account-request"
   account_provisioning_customizations_repo_name = "${var.github_username}/learn-terraform-aft-account-provisioning-customizations"
-  global_customizations_repo_name               = "${var.github_username}/learn-terraform-aft-global-customizations"
+  global_customizations_repo_name               = "${var.github_username}/learn-terraform-aft-global-customizations-cf-demo"
   account_customizations_repo_name              = "${var.github_username}/learn-terraform-aft-account-customizations"
-  
- 
 }
+
+#source = "github.com/aws-ia/terraform-aws-control_tower_account_factory?ref=1.13.4"
+#source = "git::https://github.com/aws-ia/terraform-aws-control_tower_account_factory"
